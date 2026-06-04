@@ -3,18 +3,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SITE_URL = "https://cstools-workforce.justworks.com/internal"
+SITE_URL = "https://customer-central.justworks.com/"
 SITE_USERNAME = os.environ["SITE_USERNAME"]
 SITE_PASSWORD = os.environ["SITE_PASSWORD"]
 GOOGLE_SHEET_URL = os.environ.get("GOOGLE_SHEET_URL", "")
 GOOGLE_SHEET_READ_URL = os.environ.get("GOOGLE_SHEET_READ_URL", "")
 
 DOWNLOADS_DIR = os.path.join(os.path.dirname(__file__), "downloads")
-MIDS_FILE = os.path.join(os.path.dirname(__file__), "mids.txt")
+MIDS_FILE = os.path.join(os.path.dirname(__file__), "mid.txt")
 RESULTS_FILE = os.path.join(os.path.dirname(__file__), "results.csv")
 
 OUTPUT_COLUMNS = [
-    "Key",
+    "Cobra Key",
     "WW Case",
     "Company Name",
     "CID",

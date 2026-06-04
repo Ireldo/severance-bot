@@ -1,5 +1,17 @@
 import re
+import os
+import io
+import base64
+import json
 import pdfplumber
+import requests
+import fitz  # pymupdf
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+
+LITELLM_BASE = os.getenv("LITELLM_BASE_URL", "https://litellm.justworksai.net")
+LITELLM_KEY = os.getenv("LITELLM_API_KEY", "")
 
 # Regex patterns tuned to Employer COBRA Contribution Form language.
 # Adjust after first test run if the PDF uses different phrasing.
@@ -68,7 +80,94 @@ def extract_fields(pdf_bytes: bytes, debug: bool = False) -> dict:
                 break
         fields[field] = value
 
+    # If no key fields extracted, try vision-based OCR fallback
+    key_fields = ("Medical", "Dental", "Vision", "Severance Start", "Severance End")
+    if not any(fields.get(f) for f in key_fields):
+        if debug:
+            print("No fields extracted via text — trying vision OCR fallback...")
+        vision_fields = _extract_via_vision(pdf_bytes)
+        if vision_fields:
+            fields = vision_fields
+
     return fields
+
+
+def _pdf_to_images(pdf_bytes: bytes) -> list:
+    """Convert PDF pages to base64-encoded PNG images."""
+    images = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    for page in doc:
+        pix = page.get_pixmap(dpi=200)
+        img_bytes = pix.tobytes("png")
+        images.append(base64.b64encode(img_bytes).decode("utf-8"))
+    doc.close()
+    return images
+
+
+def _extract_via_vision(pdf_bytes: bytes) -> dict | None:
+    """Use Claude vision to extract fields from scanned PDF pages."""
+    if not LITELLM_KEY:
+        return None
+
+    images = _pdf_to_images(pdf_bytes)
+    if not images:
+        return None
+
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "Extract the following fields from this COBRA Employer Contribution Form. "
+                "Return ONLY a JSON object with these exact keys:\n"
+                '- "Company Name": the employer/customer name\n'
+                '- "Name": the employee/member name\n'
+                '- "Medical": percentage (e.g. "100%") or dollar amount (e.g. "$1,550.00") or "0%" if N/A\n'
+                '- "Dental": same format as Medical\n'
+                '- "Vision": same format as Medical\n'
+                '- "Admin Fee": "Yes" if the customer pays an admin fee, otherwise ""\n'
+                '- "Severance Start": start date in MM/DD/YYYY format\n'
+                '- "Severance End": end date in MM/DD/YYYY format\n'
+                '- "Term date": termination date in MM/DD/YYYY format\n'
+                "\nIf a field is not found, use an empty string. Return only the JSON, no other text."
+            ),
+        }
+    ]
+    for img_b64 in images[:3]:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+        })
+
+    try:
+        resp = requests.post(
+            f"{LITELLM_BASE}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {LITELLM_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 500,
+                "messages": [{"role": "user", "content": content}],
+            },
+            timeout=60,
+        )
+        if not resp.ok:
+            return None
+        raw = resp.json()["choices"][0]["message"]["content"]
+        # Parse JSON from response (handle markdown code blocks)
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+        data = json.loads(raw)
+        # Normalize extracted values
+        for field in ("Medical", "Dental", "Vision", "Admin Fee", "Severance Start", "Severance End", "Term date", "Company Name"):
+            if field in data:
+                data[field] = _normalize(field, data[field]) if data[field] else ""
+        return data
+    except Exception:
+        return None
 
 
 def _read_pdf_text(pdf_bytes: bytes) -> str:

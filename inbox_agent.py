@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 # Paths
 # ---------------------------------------------------------------------------
 AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
-MIDS_FILE = os.path.join(AGENT_DIR, "mids.txt")
+MIDS_FILE = os.path.join(AGENT_DIR, "mid.txt")
 STATUS_FILE = os.path.join(AGENT_DIR, "agent_status.json")
 DASHBOARD_ENV = os.path.expanduser(
     "~/Projects/cobra-severance-dashboard/backend/.env"
@@ -45,6 +45,17 @@ SKIP_PATTERNS = re.compile(
     r"clarification|nomad\s+fees|billing",
     re.IGNORECASE,
 )
+# Patterns for tickets that are NOT severance applications
+NOT_SEVERANCE_PATTERNS = [
+    (re.compile(r"cobra\s+transfer", re.IGNORECASE), "COBRA transfer"),
+    (re.compile(r"cobra\s+change|change\s+cobra|plan\s+change|address\s+change|dependent\s+(add|remove|change)", re.IGNORECASE), "COBRA change"),
+    (re.compile(r"\bquestion\b|\basking\b|\bconfirm\b|\bclarif", re.IGNORECASE), "Question / clarification"),
+    (re.compile(r"cancel\s*(cobra|coverage)|term(inat|\.)|end\s+coverage|opt[\s\-]?out", re.IGNORECASE), "Cancellation / termination"),
+    (re.compile(r"refund|credit|overpay|overcharge", re.IGNORECASE), "Refund / billing issue"),
+    (re.compile(r"nomad|remote\s+worker", re.IGNORECASE), "Nomad / remote worker"),
+    (re.compile(r"reinstate|re-enroll|re[\s\-]?activate", re.IGNORECASE), "Reinstatement"),
+]
+FLAGGED_FILE = os.path.join(AGENT_DIR, "flagged_tickets.json")
 
 # ---------------------------------------------------------------------------
 # Status helpers
@@ -79,14 +90,30 @@ def _jira_get(path, params):
     return resp.json()
 
 
+_ASSIGNEES = (
+    "62bca79a9e6ba34c9936d311,"
+    "712020:136a1659-a83d-493f-b197-ebab0009d602,"
+    "712020:50e30179-53ac-4095-b0fb-4052b2bd6c55"
+)
+
+
 def fetch_inbox_tickets():
     jql = (
-        "project = COBRA "
-        "AND labels NOT IN (COBRA_Nomad_Request) "
-        'AND status = "To Do" '
-        "AND (assignee = EMPTY OR assignee = currentUser()) "
-        "AND created >= -30d "
-        "ORDER BY created DESC"
+        f'('
+        f'(assignee IN ({_ASSIGNEES}) OR assignee IS EMPTY) '
+        f'AND project IN (BOH, COBRA) '
+        f'AND labels = COBRA_Severance '
+        f'AND summary !~ "retroterm" '
+        f'AND statusCategory IN ("To Do", "In Progress") '
+        f'AND status NOT IN ("Waiting on Vendor", "Waiting on Customer")'
+        f') OR ('
+        f'project = COBRA '
+        f'AND "Request Type[Dropdown]" = "COBRA Billing" '
+        f'AND (assignee IN ({_ASSIGNEES}) OR assignee IS EMPTY) '
+        f'AND summary !~ "retroterm" '
+        f'AND statusCategory IN ("To Do", "In Progress") '
+        f'AND status NOT IN ("Waiting on Vendor", "Waiting on Customer")'
+        f') ORDER BY created DESC'
     )
     data = _jira_get(
         "/rest/api/3/search/jql",
@@ -129,6 +156,7 @@ def _adf_to_text(node) -> str:
 # ---------------------------------------------------------------------------
 
 def classify_ticket(ticket):
+    """Returns (mid_or_None, reason_str, flag_category_or_None)."""
     summary = ticket["summary"]
     description = ticket["description"]
     combined = summary + " " + description
@@ -137,23 +165,33 @@ def classify_ticket(ticket):
     er_paid = bool(ER_PAID_PATTERNS.search(combined))
     skip = bool(SKIP_PATTERNS.search(summary)) and not er_paid
 
-    if not mid_match:
-        return None, "no MID found"
-    if skip:
-        return None, f"skipped — question/billing keyword in summary"
+    # Check if ticket matches a non-severance category
+    flag_category = None
     if not er_paid:
-        return None, "no ER Paid / Severance keyword"
+        for pattern, category in NOT_SEVERANCE_PATTERNS:
+            if pattern.search(combined):
+                flag_category = category
+                break
 
-    return mid_match.group(0), "ER Paid + MID"
+    if not mid_match:
+        return None, "no MID found", flag_category
+    if skip:
+        return None, "skipped — question/billing keyword in summary", flag_category
+    if not er_paid:
+        return None, "no ER Paid / Severance keyword", flag_category
+
+    return mid_match.group(0), "ER Paid + MID", None
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def run(no_confirm: bool = False):
+def run(no_confirm: bool = False, only_keys=None):
     print("=" * 60)
     print("COBRA Inbox Agent")
+    if only_keys:
+        print(f"  Running on selected tickets: {', '.join(only_keys)}")
     print("=" * 60)
 
     _write_status("running", "Fetching inbox tickets from Jira...")
@@ -165,46 +203,82 @@ def run(no_confirm: bool = False):
         print(f"[error] Could not fetch tickets: {e}")
         return
 
-    print(f"\nFetched {len(tickets)} unassigned inbox tickets.\n")
+    # Filter to only selected keys if provided
+    if only_keys:
+        only_set = set(only_keys)
+        tickets = [t for t in tickets if t["key"] in only_set]
+        print(f"\nFiltered to {len(tickets)} selected ticket(s).\n")
+    else:
+        print(f"\nFetched {len(tickets)} unassigned inbox tickets.\n")
     _write_status("running", f"Filtering {len(tickets)} tickets...")
 
     included = []
     skipped = []
+    flagged = []
 
     col_w = 14
     print(f"{'Ticket':<{col_w}} {'Decision':<10} Reason")
     print("-" * 60)
     for t in tickets:
-        mid, reason = classify_ticket(t)
+        mid, reason, flag_category = classify_ticket(t)
         if mid:
             included.append({"key": t["key"], "mid": mid})
             icon = "✅"
         else:
             skipped.append(t["key"])
             icon = "❌"
+            flagged.append({
+                "key": t["key"],
+                "summary": t["summary"],
+                "category": flag_category or "Needs review",
+                "reason": reason,
+                "url": t.get("url", ""),
+            })
         print(f"{t['key']:<{col_w}} {icon:<10} {reason}  —  {t['summary'][:50]}")
 
+    # Merge new flags with existing flagged tickets (don't overwrite)
+    existing_flagged = []
+    if os.path.isfile(FLAGGED_FILE):
+        try:
+            with open(FLAGGED_FILE) as f:
+                existing_flagged = json.load(f).get("flagged", [])
+        except Exception:
+            pass
+    existing_keys = {f["key"] for f in flagged}
+    for ef in existing_flagged:
+        if ef["key"] not in existing_keys:
+            flagged.append(ef)
+    with open(FLAGGED_FILE, "w") as f:
+        json.dump({"flagged": flagged, "total_skipped": len(skipped)}, f, indent=2)
+
     print()
-    print(f"Included: {len(included)}  |  Skipped: {len(skipped)}")
+    print(f"Included: {len(included)}  |  Skipped: {len(skipped)}  |  Flagged (not severance): {len(flagged)}")
 
     if not included:
-        _write_status("done", "No ER Paid tickets found — nothing to process.")
+        _write_status("error", "No ER Paid tickets found — nothing to process.")
         print("\nNo ER Paid tickets found. Exiting.")
         return
 
-    # Clear previous results before this run
+    # Preserve rows for tickets NOT being re-processed (merge back after main.py)
     results_file = os.path.join(AGENT_DIR, "results.csv")
     if os.path.isfile(results_file):
         import csv as _csv
-        with open(results_file, "w", newline="", encoding="utf-8") as f:
-            from config import OUTPUT_COLUMNS
-            _csv.DictWriter(f, fieldnames=OUTPUT_COLUMNS).writeheader()
+        from config import OUTPUT_COLUMNS
+        keys_to_process = {e["key"] for e in included}
+        preserved_rows = []
+        with open(results_file, newline="", encoding="utf-8-sig") as f:
+            preserved_rows = [r for r in _csv.DictReader(f) if r.get("Cobra Key", "") not in keys_to_process]
+        cols = list(dict.fromkeys(OUTPUT_COLUMNS + ["Note", "Category"]))
+        with open(results_file + ".preserved", "w", newline="", encoding="utf-8") as f:
+            writer = _csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(preserved_rows)
 
-    # Write mids.txt as TICKET,MID pairs
+    # Write mid.txt as TICKET MID pairs (space-separated)
     mids = [e["mid"] for e in included]
     with open(MIDS_FILE, "w") as f:
         for e in included:
-            f.write(f"{e['key']},{e['mid']}\n")
+            f.write(f"{e['key']} {e['mid']}\n")
 
     mid_preview = ", ".join(mids[:5]) + ("..." if len(mids) > 5 else "")
     print(f"\nWrote {len(mids)} MIDs to mids.txt: {mid_preview}")
@@ -234,8 +308,9 @@ def run(no_confirm: bool = False):
     try:
         log_path = os.path.join(AGENT_DIR, "bot.log")
         log_file = open(log_path, "w")
+        cmd = [sys.executable, "main.py"]
         proc = subprocess.Popen(
-            [sys.executable, "main.py", "--headless"],
+            cmd,
             cwd=AGENT_DIR,
             stdout=log_file,
             stderr=log_file,
@@ -264,6 +339,26 @@ def run(no_confirm: bool = False):
         log_file.close()
         exit_code = proc.returncode
         if exit_code == 0:
+            # Merge new results with preserved rows from prior runs
+            import csv as _csv
+            from config import OUTPUT_COLUMNS
+            new_rows = []
+            if os.path.isfile(results_file):
+                with open(results_file, newline="", encoding="utf-8-sig") as f:
+                    new_rows = list(_csv.DictReader(f))
+            new_keys = {r.get("Cobra Key", "") for r in new_rows}
+            # Re-read preserved rows (written before main.py ran)
+            # They were saved to a temp file before launch
+            if os.path.isfile(results_file + ".preserved"):
+                with open(results_file + ".preserved", newline="", encoding="utf-8-sig") as f:
+                    preserved = [r for r in _csv.DictReader(f) if r.get("Cobra Key", "") not in new_keys]
+                combined = preserved + new_rows
+                cols = list(dict.fromkeys(OUTPUT_COLUMNS + ["Note", "Category"]))
+                with open(results_file, "w", newline="", encoding="utf-8") as f:
+                    writer = _csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(combined)
+                os.remove(results_file + ".preserved")
             _write_status("done", f"Done. {total} MIDs processed.", current=total, total=total)
             print("\nSeverance bot finished. Check results.csv.")
         else:
@@ -277,4 +372,10 @@ def run(no_confirm: bool = False):
 
 if __name__ == "__main__":
     import sys
-    run(no_confirm="--no-confirm" in sys.argv)
+    _no_confirm = "--no-confirm" in sys.argv
+    _keys = None
+    if "--keys" in sys.argv:
+        idx = sys.argv.index("--keys")
+        if idx + 1 < len(sys.argv):
+            _keys = [k.strip() for k in sys.argv[idx + 1].split(",") if k.strip()]
+    run(no_confirm=_no_confirm, only_keys=_keys)

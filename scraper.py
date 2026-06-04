@@ -1,16 +1,16 @@
+import re
 from typing import Optional
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
 from config import SITE_URL, SITE_USERNAME, SITE_PASSWORD
 
 
 def login(page: Page) -> None:
-    """Navigate to the app and complete Okta SSO login."""
+    """Navigate to customer-central and complete Okta SSO login."""
     page.goto(SITE_URL, wait_until="networkidle", timeout=20_000)
 
     if "okta.com" not in page.url:
         raise Exception(f"Expected Okta login page, got: {page.url}")
 
-    # Click "Sign in with Okta FastPass"
     fastpass_selectors = [
         "button:has-text('Okta FastPass')",
         "a:has-text('Okta FastPass')",
@@ -21,7 +21,6 @@ def login(page: Page) -> None:
     for sel in fastpass_selectors:
         try:
             page.click(sel, timeout=4_000)
-            print(f"[login] Clicked FastPass with selector: {sel}")
             clicked = True
             break
         except Exception:
@@ -30,230 +29,283 @@ def login(page: Page) -> None:
     if not clicked:
         print("[login] Could not find FastPass button — please log in manually in the browser.")
 
-    print("\n[login] Waiting up to 2 minutes for you to complete login...")
-
-
-    # Wait until redirected back to the app
-    page.wait_for_url("**/cstools-workforce.justworks.com/**", timeout=120_000)
+    print("[login] Waiting up to 2 minutes for you to complete login...")
+    page.wait_for_url("**/customer-central.justworks.com/**", timeout=120_000)
     print("[login] Authenticated successfully.")
 
-    # Step 1: Fill username
-    username_selectors = [
-        "#okta-signin-username",
-        "input[name='identifier']",
-        "input[type='email']",
-        "input[autocomplete='username']",
-    ]
-    for sel in username_selectors:
+
+def _find_search_input(page: Page, query: str) -> bool:
+    """Find and use the global search input. Returns True on success."""
+    for sel in [
+        "header input",
+        "input[type='search']",
+        "input[placeholder='Search']",
+        "input[aria-label*='search' i]",
+        "input[role='searchbox']",
+        "input",
+    ]:
         try:
-            page.fill(sel, SITE_USERNAME, timeout=5_000)
-            print(f"[login] Filled username with selector: {sel}")
-            break
+            el = page.locator(sel).first
+            el.wait_for(timeout=3_000)
+            el.click()
+            el.fill(query)
+            el.press("Enter")
+            return True
         except Exception:
             continue
+    return False
 
 
-    page.wait_for_url("**/cstools-workforce.justworks.com/**", timeout=30_000)
-    print("[login] Authenticated successfully.")
+def _extract_cid_from_page(page: Page) -> str:
+    """Extract CID (e.g. C91813) from the current company page text."""
+    try:
+        page.wait_for_timeout(2000)
+        body_text = page.inner_text("body", timeout=5_000)
+        match = re.search(r'\b(C\d{4,8})\b', body_text)
+        return match.group(1) if match else ""
+    except Exception:
+        return ""
 
 
-def search_member(page: Page, mid: str) -> Optional[dict]:
+def search_member(page: Page, cid: str, mid: str) -> Optional[dict]:
     """
-    Search for a member by MID.
-    Flow:
-      1. Type MID in top-right search bar → Enter
-      2. "Request diagnostic authorization" screen appears
-      3. Select "Other" from the category options
-      4. Append " -" to the MID in the input field
-      5. Click Submit
-      6. Land on Company profile page
+    Search for a member by MID on customer-central.
+    Flow: search MID → get member name from results → click company name → land on company page.
     Returns dict with {name, company_name, cid} or None.
     """
-    try:
-        # Navigate to the main page first to ensure search bar is available
-        page.goto(SITE_URL, wait_until="networkidle", timeout=15_000)
-
-        # Step 1: Type MID in the search bar and press Enter
-        search_input = page.locator(
-            "input[placeholder*='Search'], input[type='search'], [data-testid*='search'] input"
-        ).first
-        search_input.wait_for(timeout=8_000)
-        search_input.click()
-        search_input.fill(mid)
-        search_input.press("Enter")
-
-        # Step 2: Wait briefly to see which screen loads
-        page.wait_for_load_state("networkidle", timeout=10_000)
-
-    except PlaywrightTimeout as e:
-        print(f"[search] MID {mid}: page did not load after search — {e}")
+    search_term = mid or cid
+    if not search_term:
+        print(f"[search] No MID or CID provided.")
         return None
 
-    # Check if authorization screen appeared by looking for its heading
-    try:
-        page.locator("h1:has-text('Request diagnostic authorization'), h2:has-text('Request diagnostic authorization')").wait_for(timeout=12_000)
-        print(f"[search] MID {mid}: authorization screen appeared, filling form.")
+    # Search by MID with one retry
+    for attempt in range(2):
+        try:
+            page.goto(SITE_URL, wait_until="networkidle", timeout=30_000)
+            page.wait_for_timeout(1500)
 
-        # Select "Other" radio
-        page.locator("label:has-text('Other')").click(timeout=5_000)
-
-        # Fill "-" in the last text input (Other's field)
-        page.locator("input[type='text']").last.fill("-", timeout=5_000)
-        print(f"[search] MID {mid}: typed '-' in Other field.")
-
-        # Small pause to ensure form is ready, then click Submit
-        page.wait_for_timeout(500)
-        submit_btn = page.get_by_role("button", name="Submit")
-        submit_btn.wait_for(timeout=5_000)
-        submit_btn.click()
-        page.wait_for_load_state("networkidle", timeout=15_000)
-        print(f"[search] MID {mid}: submitted, now on company profile.")
-
-    except PlaywrightTimeout:
-        print(f"[search] MID {mid}: authorization screen bypassed, continuing.")
-
-    return _extract_profile_data(page, mid)
-
-
-def _extract_profile_data(page: Page, mid: str) -> Optional[dict]:
-    """Scrape Company Name, CID, and member Name from the Company profile page."""
-    import re as _re
-    data = {"name": "", "company_name": "", "cid": ""}
-
-    try:
-        page.wait_for_load_state("networkidle", timeout=8_000)
-    except PlaywrightTimeout:
-        pass
-
-    # CID — appears in the top nav as "C17455" (C + digits)
-    try:
-        nav_text = page.locator("nav, .navbar, header").first.inner_text(timeout=5_000)
-        cid_match = _re.search(r'\b(C\d{4,})\b', nav_text)
-        if cid_match:
-            data["cid"] = cid_match.group(1)
-    except Exception:
-        pass
-
-    # Company Name — in the top nav, between PRODUCTION badge and plan badge
-    # Skip known non-company labels: CSTools, PRODUCTION, plan badge text, CID, MID
-    skip_contains = ["cstools", "production", "peo plan", "aso plan", "plus plan", "basic plan"]
-    try:
-        nav_links = page.locator("nav a, .navbar a, header a").all()
-        for el in nav_links:
-            text = el.inner_text().strip()
-            text_lower = text.lower()
-            if (text
-                    and not _re.match(r'^[CM]\d+', text)
-                    and len(text) > 3
-                    and not any(s in text_lower for s in skip_contains)):
-                data["company_name"] = text
+            if _find_search_input(page, search_term):
+                page.wait_for_load_state("networkidle", timeout=10_000)
+                page.wait_for_timeout(1000)
                 break
-    except Exception:
-        pass
+            else:
+                if attempt == 0:
+                    continue
+                print(f"[search] MID {mid}: could not find any search input.")
+                return None
+        except PlaywrightTimeout as e:
+            if attempt == 0:
+                continue
+            print(f"[search] MID {mid}: page did not load after search — {e}")
+            return None
 
-    # Member Name — check "You last searched for" section first, then Terminated tab
+    data = {"name": "", "company_name": "", "cid": cid}
+
+    # From the search results: the member result is a single link containing
+    # name, status, company, email, phone. Click it to go to member page,
+    # then click the company name on the left to reach the company page.
     try:
-        row = page.locator(f"tr:has-text('{mid}')").first
-        row.wait_for(timeout=4_000)
-        cells = row.locator("td").all()
-        if len(cells) >= 4:
-            data["name"] = cells[3].inner_text().strip()
-    except Exception:
-        pass
+        page.wait_for_timeout(1500)
 
+        # Find the member result link (href contains /members/)
+        member_link = page.locator("a[href*='/members/']").first
+        member_link.wait_for(timeout=8_000)
 
-    print(f"[search] MID {mid}: name='{data['name']}' company='{data['company_name']}' cid='{data['cid']}'")
-    return data if any(data.values()) else None
+        # Parse the member name and company from the link text
+        link_text = member_link.inner_text(timeout=3_000)
+        lines = [l.strip() for l in link_text.split("\n") if l.strip()]
+        skip_words = {"member", "terminated", "active"}
+        for line in lines:
+            if not data["cid"] and re.match(r'^C\d+$', line):
+                data["cid"] = line
+            elif (not re.match(r'^[CM]\d+', line)
+                    and line.lower() not in skip_words
+                    and not re.match(r'^[\(\d\+]', line)
+                    and "@" not in line
+                    and len(line) > 2):
+                if not data["name"]:
+                    data["name"] = line
+                elif not data["company_name"]:
+                    data["company_name"] = line
+                    break
 
-
-def download_cobra_pdf(page: Page, member_name: str, mid: str) -> Optional[str]:
-    """
-    On the Company profile page:
-    1. Click 'Internal Documents'
-    2. Search by member name
-    3. Find 'Employer COBRA Contribution Form - [Name] - Executed.pdf'
-    4. Download and return local path, or None if not found.
-    """
-    # Step 1: Click Internal Documents button (visible on right side of company profile)
-    try:
-        page.wait_for_selector("text=Internal Documents", timeout=12_000)
-        page.get_by_text("Internal Documents", exact=True).click(timeout=8_000)
+        # Click the member link to go to the member page
+        member_link.click(timeout=5_000)
         page.wait_for_load_state("networkidle", timeout=10_000)
-    except PlaywrightTimeout:
-        print(f"[pdf] MID {mid}: could not find 'Internal Documents' button.")
+        page.wait_for_timeout(1500)
+
+        # Now click the company name on the left sidebar to navigate to company page
+        if data["company_name"]:
+            try:
+                page.locator(f"a:has-text('{data['company_name']}')").first.click(timeout=5_000)
+                page.wait_for_load_state("networkidle", timeout=10_000)
+                if not data["cid"]:
+                    data["cid"] = _extract_cid_from_page(page)
+                print(f"[search] MID {mid}: found member '{data['name']}' at '{data['company_name']}' (CID: {data['cid']})")
+                return data
+            except PlaywrightTimeout:
+                pass
+
+        # Fallback: look for any company link in sidebar
+        try:
+            company_link = page.locator("a[href*='/companies/']").first
+            company_link.wait_for(timeout=5_000)
+            data["company_name"] = company_link.inner_text().strip()
+            company_link.click(timeout=5_000)
+            page.wait_for_load_state("networkidle", timeout=10_000)
+            if not data["cid"]:
+                data["cid"] = _extract_cid_from_page(page)
+            print(f"[search] MID {mid}: found member '{data['name']}' at '{data['company_name']}' (CID: {data['cid']})")
+            return data
+        except PlaywrightTimeout:
+            pass
+
+        print(f"[search] MID {mid}: could not navigate to company page.")
         return None
 
-    # Step 2: Find the COBRA row by member name in the Title column
-    # Name from profile is "Last, First" — convert to "First Last" for title matching
-    import re as _re
+    except PlaywrightTimeout:
+        print(f"[search] MID {mid}: no member result found in search.")
+        return None
+    except Exception as e:
+        print(f"[search] MID {mid}: error processing search results — {e}")
+        return None
+
+
+def download_cobra_pdf(page: Page, member_name: str, mid: str) -> Optional[bytes]:
+    """
+    Navigate to the COBRA document on customer-central:
+    1. Click 'Documents' in the left sidebar
+    2. Click 'Internal' tab (handles both page layouts)
+    3. Click 'View all' next to 'Uncategorized'
+    4. Find COBRA form by member name (prefer most recent)
+    5. Open viewer and download PDF
+    """
+    # Step 1: Click Documents in the left sidebar
+    try:
+        page.wait_for_timeout(1000)
+        page.locator("nav a:has-text('Documents'), aside a:has-text('Documents')").first.click(timeout=8_000)
+        page.wait_for_load_state("networkidle", timeout=10_000)
+        page.wait_for_timeout(2000)
+    except PlaywrightTimeout:
+        print(f"[pdf] MID {mid}: could not find 'Documents' in sidebar.")
+        return None
+
+    # Step 2: Click the Internal tab (next to the "Company" tab)
+    try:
+        page.wait_for_timeout(1500)
+
+        # Scroll down to find the tabs section if needed
+        for _ in range(5):
+            page.evaluate("window.scrollBy(0, 400)")
+            page.wait_for_timeout(300)
+
+        # Look for tab-like elements containing "Internal" — exclude the info banner
+        # The tab is near the "Company" tab text
+        internal_tab = None
+        candidates = page.get_by_text("Internal", exact=True).all()
+        for candidate in candidates:
+            # Skip if it's inside a long text block (the info banner)
+            parent_text = candidate.inner_text().strip()
+            if len(parent_text) < 20:
+                internal_tab = candidate
+                break
+
+        if internal_tab is None and candidates:
+            internal_tab = candidates[0]
+
+        if internal_tab is None:
+            print(f"[pdf] MID {mid}: could not find 'Internal' tab.")
+            return None
+
+        internal_tab.scroll_into_view_if_needed()
+        page.wait_for_timeout(300)
+        internal_tab.click(timeout=5_000)
+        page.wait_for_load_state("networkidle", timeout=10_000)
+        page.wait_for_timeout(1500)
+    except PlaywrightTimeout:
+        print(f"[pdf] MID {mid}: could not find 'Internal' tab.")
+        return None
+
+    # Step 3: Click "View all" next to "Uncategorized"
+    try:
+        uncategorized_row = page.locator("*:has-text('Uncategorized')").filter(has_text="View all").last
+        uncategorized_row.locator("text=View all").click(timeout=8_000)
+        page.wait_for_load_state("networkidle", timeout=10_000)
+        page.wait_for_timeout(1500)
+    except PlaywrightTimeout:
+        print(f"[pdf] MID {mid}: could not find Uncategorized 'View all' link.")
+        return None
+
+    # Step 4: Find the COBRA row matching the member name
     name_parts = member_name.split(",")
     if len(name_parts) == 2:
         first_last = f"{name_parts[1].strip()} {name_parts[0].strip()}"
     else:
         first_last = member_name.strip()
 
-    # Also get just the last name as a fallback
     last_name = name_parts[0].strip() if name_parts else ""
+    # Also try just the last name for partial matches
+    last_name_only = name_parts[0].strip() if "," in member_name else member_name.split()[-1] if member_name else ""
 
-    page.wait_for_selector("table", timeout=8_000)
-
-    # Find a row whose Title cell contains the member name and "COBRA"
     cobra_row = None
-    for name_variant in [first_last, last_name]:
+    for name_variant in [first_last, member_name, last_name, last_name_only]:
         if not name_variant:
             continue
         try:
-            cobra_row = page.locator(f"tr:has-text('COBRA')").filter(has_text=name_variant).first
-            cobra_row.wait_for(timeout=3_000)
-            break
+            matches = page.locator("tr:has-text('COBRA')").filter(has_text=name_variant).all()
+            if matches:
+                cobra_row = matches[-1]
+                cobra_row.wait_for(timeout=3_000)
+                break
         except PlaywrightTimeout:
             cobra_row = None
             continue
 
+    # Also try searching for the member name without requiring "COBRA" in the row
+    # (some files are named like "Miriam Nadler_Employer COBRA Contribution Form")
     if cobra_row is None:
-        print(f"[pdf] MID {mid}: no COBRA document row found for '{member_name}'.")
+        for name_variant in [first_last, member_name, last_name]:
+            if not name_variant:
+                continue
+            try:
+                matches = page.locator("tr").filter(has_text=name_variant).filter(has_text="Contribution").all()
+                if matches:
+                    cobra_row = matches[-1]
+                    cobra_row.wait_for(timeout=3_000)
+                    break
+            except PlaywrightTimeout:
+                cobra_row = None
+                continue
+
+    if cobra_row is None:
+        print(f"[pdf] MID {mid}: no COBRA document found for '{member_name}'.")
         return None
 
-    # Step 3: Get the View link href and fetch the PDF directly using browser cookies
-    import requests as _requests
-
+    # Step 5: Open the viewer and download the PDF
     try:
-        view_link = cobra_row.locator("a:has-text('View'):not(:has-text('Delete'))").first
-        href = view_link.get_attribute("href", timeout=5_000)
-        print(f"[pdf] MID {mid}: View href = {href}")
+        cobra_row.locator("a").first.click(timeout=5_000)
+        page.wait_for_load_state("networkidle", timeout=10_000)
+        page.wait_for_timeout(1500)
     except PlaywrightTimeout:
-        print(f"[pdf] MID {mid}: could not get View link href.")
+        print(f"[pdf] MID {mid}: could not open document viewer.")
         return None
-
-    if not href:
-        print(f"[pdf] MID {mid}: View link has no href.")
-        return None
-
-    # Build full URL if relative
-    if href.startswith("/"):
-        href = f"https://cstools-workforce.justworks.com{href}"
-
-    # Use browser cookies to fetch the PDF directly
-    cookies = page.context.cookies()
-    session = _requests.Session()
-    for c in cookies:
-        session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
 
     try:
-        resp = session.get(href, timeout=20, allow_redirects=True)
-        resp.raise_for_status()
-        content = resp.content
-        ct = resp.headers.get("content-type", "")
-        print(f"[pdf] MID {mid}: fetched {len(content)} bytes, content-type={ct}")
+        with page.expect_download(timeout=15_000) as download_info:
+            page.locator("a:has-text('Download'), button:has-text('Download')").first.click(timeout=5_000)
+        download = download_info.value
+        path = download.path()
+        content = open(path, "rb").read()
 
-        # Accept if it's a PDF (by content-type or magic bytes)
-        if "pdf" in ct.lower() or content[:4] == b"%PDF":
-            print(f"[pdf] MID {mid}: PDF confirmed.")
+        if content[:4] == b"%PDF" or b"%PDF" in content[:10]:
+            print(f"[pdf] MID {mid}: PDF downloaded successfully ({len(content)} bytes).")
             return content
 
-        # Not a PDF — log a sample of what we got and fall through
-        print(f"[pdf] MID {mid}: response is not a PDF. First 200 chars: {content[:200]}")
+        print(f"[pdf] MID {mid}: downloaded file is not a PDF.")
+        return None
+    except PlaywrightTimeout:
+        print(f"[pdf] MID {mid}: download timed out.")
         return None
     except Exception as e:
-        print(f"[pdf] MID {mid}: direct fetch failed — {e}")
+        print(f"[pdf] MID {mid}: download failed — {e}")
         return None

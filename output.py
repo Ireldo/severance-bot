@@ -6,12 +6,18 @@ import requests
 from config import MIDS_FILE, RESULTS_FILE, OUTPUT_COLUMNS, GOOGLE_SHEET_URL, GOOGLE_SHEET_READ_URL
 
 MID_PATTERN = re.compile(r"^M\d+$")
+CID_PATTERN = re.compile(r"^C\d+$")
 
 
 def read_mids() -> list:
     """
-    Fetch MIDs from Google Sheet via Apps Script, falling back to mids.txt.
-    Returns list of dicts with keys: ticket, ww_case, mid
+    Fetch entries from Google Sheet via Apps Script, falling back to mid.txt.
+    Returns list of dicts with keys: ticket, ww_case, mid, cid
+
+    mid.txt format (space-separated, one entry per line):
+      M1234567                     — MID only
+      COBRA-5467 M1234567          — ticket + MID
+      COBRA-5467 C92657 M1234567   — ticket + CID + MID
     """
     mids = []
 
@@ -22,9 +28,8 @@ def read_mids() -> list:
             raw = resp.json()
             mids = [m.strip() for m in raw if isinstance(m, str) and MID_PATTERN.match(m.strip())]
             print(f"[sheets] Fetched {len(mids)} MID(s) from Google Sheet.")
-        except Exception as e:
-            print(f"[sheets] Warning: could not read from Google Sheet — {e}")
-            print("[sheets] Falling back to mids.txt")
+        except Exception:
+            pass
 
     if not mids:
         entries = []
@@ -33,16 +38,48 @@ def read_mids() -> list:
                 line = line.strip()
                 if not line:
                     continue
-                if "," in line:
-                    ticket, mid = line.split(",", 1)
-                    ticket, mid = ticket.strip(), mid.strip()
-                    if MID_PATTERN.match(mid):
-                        entries.append({"ticket": ticket, "ww_case": "", "mid": mid})
-                elif MID_PATTERN.match(line):
-                    entries.append({"ticket": "", "ww_case": "", "mid": line})
+                parts = line.split()
+                cid = ""
+                mid = ""
+                ticket = ""
+                for p in parts:
+                    if MID_PATTERN.match(p):
+                        mid = p
+                    elif CID_PATTERN.match(p):
+                        cid = p
+                    elif not ticket:
+                        ticket = p
+                if mid:
+                    entries.append({"ticket": ticket, "ww_case": "", "mid": mid, "cid": cid})
         return entries
 
-    return [{"ticket": "", "ww_case": "", "mid": mid} for mid in mids]
+    # Enrich sheet-sourced MIDs with ticket keys and CIDs from mid.txt
+    mid_to_ticket = {}
+    mid_to_cid = {}
+    if os.path.isfile(MIDS_FILE):
+        with open(MIDS_FILE, encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                ticket = ""
+                mid_val = ""
+                cid_val = ""
+                for p in parts:
+                    if MID_PATTERN.match(p):
+                        mid_val = p
+                    elif CID_PATTERN.match(p):
+                        cid_val = p
+                    elif not ticket:
+                        ticket = p
+                if mid_val:
+                    if ticket:
+                        mid_to_ticket[mid_val] = ticket
+                    if cid_val:
+                        mid_to_cid[mid_val] = cid_val
+
+    return [{"ticket": mid_to_ticket.get(mid, ""), "ww_case": "", "mid": mid, "cid": mid_to_cid.get(mid, "")} for mid in mids]
 
 
 def clear_results() -> None:
