@@ -9,3 +9,4 @@ bot.log
 agent_status.json
 mids.txt
 .DS_Store
+.auth_state.json

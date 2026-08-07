@@ -12,18 +12,20 @@ import os
 import re
 import json
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
+import audit
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MIDS_FILE = os.path.join(AGENT_DIR, "mid.txt")
-STATUS_FILE = os.path.join(AGENT_DIR, "agent_status.json")
+STATUS_FILE = os.path.join(AGENT_DIR, "logs", "agent_status.json")
 DASHBOARD_ENV = os.path.expanduser(
     "~/Projects/cobra-severance-dashboard/backend/.env"
 )
@@ -55,7 +57,7 @@ NOT_SEVERANCE_PATTERNS = [
     (re.compile(r"nomad|remote\s+worker", re.IGNORECASE), "Nomad / remote worker"),
     (re.compile(r"reinstate|re-enroll|re[\s\-]?activate", re.IGNORECASE), "Reinstatement"),
 ]
-FLAGGED_FILE = os.path.join(AGENT_DIR, "flagged_tickets.json")
+FLAGGED_FILE = os.path.join(AGENT_DIR, "logs", "flagged_tickets.json")
 
 # ---------------------------------------------------------------------------
 # Status helpers
@@ -305,15 +307,27 @@ def run(no_confirm: bool = False, only_keys=None):
     total = len(mids)
     _write_status("running", "Launching severance bot...", current=0, total=total)
 
+    ticket_keys = [e["key"] for e in included]
+    audit_record = audit.start_run(
+        trigger="inbox_agent",
+        total_mids=total,
+        source="jira",
+        tickets=ticket_keys,
+    )
+
     try:
-        log_path = os.path.join(AGENT_DIR, "bot.log")
+        log_path = os.path.join(AGENT_DIR, "logs", "bot.log")
         log_file = open(log_path, "w")
+        env = os.environ.copy()
+        env["SEVERANCE_TRIGGER"] = "inbox_agent"
+        src_dir = os.path.join(AGENT_DIR, "src")
         cmd = [sys.executable, "main.py"]
         proc = subprocess.Popen(
             cmd,
-            cwd=AGENT_DIR,
+            cwd=src_dir,
             stdout=log_file,
             stderr=log_file,
+            env=env,
         )
 
         # Monitor results.csv row count and update status as each MID is processed
@@ -360,13 +374,18 @@ def run(no_confirm: bool = False, only_keys=None):
                     writer.writerows(combined)
                 os.remove(results_file + ".preserved")
             _write_status("done", f"Done. {total} MIDs processed.", current=total, total=total)
+            audit.finalize_run(audit_record, results_file)
             print("\nSeverance bot finished. Check results.csv.")
         else:
             _write_status("error", f"main.py exited with code {exit_code}")
+            audit_record.errors.append(f"main.py exited with code {exit_code}")
+            audit.finalize_run(audit_record, results_file)
             print(f"\n[error] main.py exited with code {exit_code}")
 
     except Exception as e:
         _write_status("error", str(e))
+        audit_record.errors.append(str(e))
+        audit.finalize_run(audit_record, results_file)
         print(f"\n[error] {e}")
 
 

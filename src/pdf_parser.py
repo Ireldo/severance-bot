@@ -3,6 +3,7 @@ import os
 import io
 import base64
 import json
+from datetime import datetime
 import pdfplumber
 import requests
 import fitz  # pymupdf
@@ -12,6 +13,23 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 LITELLM_BASE = os.getenv("LITELLM_BASE_URL", "https://litellm.justworksai.net")
 LITELLM_KEY = os.getenv("LITELLM_API_KEY", "")
+
+_MONTH_NAMES = r"(?:January|February|March|April|May|June|July|August|September|October|November|December)"
+_WRITTEN_DATE = rf"({_MONTH_NAMES}\s+\d{{1,2}},?\s+\d{{4}})"
+
+
+def _normalize_date(val: str) -> str:
+    """Convert 'July 15, 2026' or '7/15/2026' to MM/DD/YYYY."""
+    val = val.strip()
+    if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", val):
+        return val
+    for fmt in ("%B %d, %Y", "%B %d %Y"):
+        try:
+            return datetime.strptime(val, fmt).strftime("%m/%d/%Y")
+        except ValueError:
+            continue
+    return val
+
 
 # Regex patterns tuned to Employer COBRA Contribution Form language.
 # Adjust after first test run if the PDF uses different phrasing.
@@ -33,23 +51,55 @@ _PATTERNS = {
     "Vision": [
         r"Vision\s+(\d{1,3}%|\$[\d,]+\.\d{2}|N/A)",
     ],
-    "Admin Fee": [
+    "Admin Fee Yes": [
         # "Customer will be responsible for the 2% admin fee" → Yes
         r"(Customer will be responsible for the \d+% admin fee)",
+        r"(responsible for the \d+% admin(?:istration)? fee)",
+    ],
+    "Admin Fee No": [
+        # "Customer will not be responsible for the 2% admin fee" → No
+        r"(Customer will not be responsible for the \d+% admin fee)",
+        r"(not be responsible for the \d+% admin(?:istration)? fee)",
+        # "the 2% admin fee will be waived"
+        r"(\d+% admin(?:istration)? fee (?:will be |is )?waived)",
+        # "Justworks will cover the admin fee" or "no admin fee"
+        r"(no admin(?:istration)? fee)",
+        r"(admin(?:istration)? fee.{0,20}(?:waived|covered|N/?A|not applicable))",
     ],
     "Severance Start": [
         # "starting on 04/01/26" or "starting on 04/01/2026"
         r"starting on (\d{1,2}/\d{1,2}/\d{2,4})",
+        # "starting on August 1, 2026"
+        rf"starting on\s+{_WRITTEN_DATE}",
     ],
     "Severance End": [
-        # "(i) 6 months ending on 09/30/26" — \s+ handles newline between "on" and date
-        r"\(i\)\s+\d+\s+months?\s+ending on\s+(\d{1,2}/\d{1,2}/\d{2,4})",
+        # "(i) 6 months ending on 09/30/26" — month(s) or months; \s+ handles newlines
+        r"\(i\)\s+\d+\s+month(?:s|\(s\))?\s+ending\s+on\s+(\d{1,2}/\d{1,2}/\d{2,4})",
+        # "(i) 6 months ending on September 30, 2026"
+        rf"\(i\)\s+\d+\s+month(?:s|\(s\))?\s+ending\s+on\s+{_WRITTEN_DATE}",
+        # "ending on 09/30/2026" without (i) prefix
+        r"ending\s+on\s+(\d{1,2}/\d{1,2}/\d{2,4})",
+        # "ending on September 30, 2026" without (i) prefix
+        rf"ending\s+on\s+{_WRITTEN_DATE}",
+        # "through 09/30/2026" or "through September 30, 2026"
+        r"through\s+(\d{1,2}/\d{1,2}/\d{2,4})",
+        rf"through\s+{_WRITTEN_DATE}",
+        # "until 09/30/2026" or "until September 30, 2026"
+        r"until\s+(\d{1,2}/\d{1,2}/\d{2,4})",
+        rf"until\s+{_WRITTEN_DATE}",
+        # "(i) 6 months ending 09/30/2026" (no "on")
+        r"\(i\)\s+\d+\s+month(?:s|\(s\))?\s+ending\s+(\d{1,2}/\d{1,2}/\d{2,4})",
+        rf"\(i\)\s+\d+\s+month(?:s|\(s\))?\s+ending\s+{_WRITTEN_DATE}",
     ],
     "Term date": [
         # "termination date of 04/01/2026" or "termination date: 04/01/2026"
         r"termination date\s*(?:of|:)\s*(\d{1,2}/\d{1,2}/\d{2,4})",
         # "terminated on 04/01/2026" or "terminated effective 04/01/2026"
         r"terminated\s+(?:on|effective)\s+(\d{1,2}/\d{1,2}/\d{2,4})",
+        # "terminated on July 15, 2026"
+        rf"terminated\s+(?:on|effective)\s+{_WRITTEN_DATE}",
+        # "termination date of July 15, 2026"
+        rf"termination date\s*(?:of|:)\s*{_WRITTEN_DATE}",
         # "term date: 04/01/2026"
         r"term\s+date\s*[:\-]\s*(\d{1,2}/\d{1,2}/\d{2,4})",
         # "effective date of termination" followed by date
@@ -71,6 +121,8 @@ def extract_fields(pdf_bytes: bytes, debug: bool = False) -> dict:
     fields = {}
 
     for field, patterns in _PATTERNS.items():
+        if field in ("Admin Fee Yes", "Admin Fee No"):
+            continue
         value = ""
         for pattern in patterns:
             match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
@@ -79,6 +131,19 @@ def extract_fields(pdf_bytes: bytes, debug: bool = False) -> dict:
                 value = _normalize(field, raw)
                 break
         fields[field] = value
+
+    # Admin Fee: check "No" first (more specific — contains "not"), then "Yes"
+    admin_fee = ""
+    for pattern in _PATTERNS["Admin Fee No"]:
+        if re.search(pattern, text, re.MULTILINE | re.IGNORECASE):
+            admin_fee = "No"
+            break
+    if not admin_fee:
+        for pattern in _PATTERNS["Admin Fee Yes"]:
+            if re.search(pattern, text, re.MULTILINE | re.IGNORECASE):
+                admin_fee = "Yes"
+                break
+    fields["Admin Fee"] = admin_fee
 
     # If no key fields extracted, try vision-based OCR fallback
     key_fields = ("Medical", "Dental", "Vision", "Severance Start", "Severance End")
@@ -124,7 +189,7 @@ def _extract_via_vision(pdf_bytes: bytes) -> dict | None:
                 '- "Medical": percentage (e.g. "100%") or dollar amount (e.g. "$1,550.00") or "0%" if N/A\n'
                 '- "Dental": same format as Medical\n'
                 '- "Vision": same format as Medical\n'
-                '- "Admin Fee": "Yes" if the customer pays an admin fee, otherwise ""\n'
+                '- "Admin Fee": "Yes" if the customer pays the admin fee, "No" if the admin fee is waived or not applicable, otherwise ""\n'
                 '- "Severance Start": start date in MM/DD/YYYY format\n'
                 '- "Severance End": end date in MM/DD/YYYY format\n'
                 '- "Term date": termination date in MM/DD/YYYY format\n'
@@ -188,10 +253,15 @@ def _normalize(field: str, value: str) -> str:
         elif not value.endswith("%") and not value.startswith("$"):
             value = value + "%"
     elif field == "Admin Fee":
-        # Any match on this pattern means Yes
-        value = "Yes"
+        low = value.lower().strip()
+        if low in ("yes", "true", "1"):
+            value = "Yes"
+        elif low in ("no", "false", "0", "n/a", "waived", ""):
+            value = "No" if low else ""
+        else:
+            value = "Yes"
     elif field in ("Severance Start", "Severance End", "Term date"):
-        # Normalize to MM/DD/YYYY with zero-padded month and day
+        value = _normalize_date(value)
         parts = value.split("/")
         if len(parts) == 3:
             month = parts[0].zfill(2)

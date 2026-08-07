@@ -1,26 +1,57 @@
+import os
 import re
+import time
 from typing import Optional
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeout
-from config import SITE_URL, SITE_USERNAME, SITE_PASSWORD
+from playwright.sync_api import Page, BrowserContext, TimeoutError as PlaywrightTimeout
+from config import SITE_URL, SITE_USERNAME, SITE_PASSWORD, AUTH_STATE_FILE
+
+MAX_AUTH_AGE_HOURS = 12
+
+
+def load_auth_state() -> Optional[str]:
+    """Return path to saved auth state if it exists and is fresh, else None."""
+    if not os.path.isfile(AUTH_STATE_FILE):
+        return None
+    age_hours = (time.time() - os.path.getmtime(AUTH_STATE_FILE)) / 3600
+    if age_hours > MAX_AUTH_AGE_HOURS:
+        os.remove(AUTH_STATE_FILE)
+        return None
+    return AUTH_STATE_FILE
+
+
+def save_auth_state(context: BrowserContext) -> None:
+    """Persist browser cookies/localStorage for session reuse."""
+    context.storage_state(path=AUTH_STATE_FILE)
 
 
 def login(page: Page) -> None:
     """Navigate to customer-central and complete Okta SSO login."""
-    page.goto(SITE_URL, wait_until="networkidle", timeout=20_000)
+    page.goto(SITE_URL, wait_until="domcontentloaded", timeout=30_000)
+    # Wait briefly for redirects to settle
+    page.wait_for_timeout(3_000)
+
+    if "customer-central.justworks.com" in page.url:
+        print("[login] Reusing saved session.")
+        page.wait_for_load_state("networkidle", timeout=15_000)
+        return
 
     if "okta.com" not in page.url:
         raise Exception(f"Expected Okta login page, got: {page.url}")
 
+    # Wait for the Okta login form to render
+    page.wait_for_load_state("networkidle", timeout=15_000)
+
     fastpass_selectors = [
-        "button:has-text('Okta FastPass')",
+        "a:has-text('Sign in with Okta FastPass')",
         "a:has-text('Okta FastPass')",
+        "button:has-text('Okta FastPass')",
         "[data-se='okta-fastpass']",
         "button:has-text('Fast')",
     ]
     clicked = False
     for sel in fastpass_selectors:
         try:
-            page.click(sel, timeout=4_000)
+            page.click(sel, timeout=5_000)
             clicked = True
             break
         except Exception:
@@ -276,6 +307,21 @@ def download_cobra_pdf(page: Page, member_name: str, mid: str) -> Optional[bytes
             except PlaywrightTimeout:
                 cobra_row = None
                 continue
+
+    # Fallback: search by first name + COBRA/Severance keywords (handles last-name typos in filenames)
+    if cobra_row is None:
+        first_name = first_last.split()[0] if first_last else ""
+        if first_name and len(first_name) >= 3:
+            for keyword in ["COBRA", "Severance", "Agreement"]:
+                try:
+                    matches = page.locator("tr").filter(has_text=first_name).filter(has_text=keyword).all()
+                    if matches:
+                        cobra_row = matches[-1]
+                        cobra_row.wait_for(timeout=3_000)
+                        break
+                except PlaywrightTimeout:
+                    cobra_row = None
+                    continue
 
     if cobra_row is None:
         print(f"[pdf] MID {mid}: no COBRA document found for '{member_name}'.")
